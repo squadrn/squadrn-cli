@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.0-rc.6
 
 - **Gemini CLI and personal accounts:** since 2026-06-18 Google refuses Gemini CLI for personal
   Google accounts, Google AI Pro and Ultra (*"This client is no longer supported for Gemini Code

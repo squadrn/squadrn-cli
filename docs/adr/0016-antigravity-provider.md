@@ -15,10 +15,10 @@ to relocate its config dir** (google-antigravity/antigravity-cli#155, open since
 Everything hangs off the home directory, so an account can only be isolated by running `agy`
 with another `HOME`, which every command the agent runs inherits.
 
-Facts checked on 2026-11-21 against agy 1.5.14 (macOS x86_64). **P** = observed in the probe
-below, **D** = the docs agy ships in its builtin `agy-customizations` skill, **S** = read from
-the binary's strings, **W** = Google's web docs or the issue tracker, not verified locally. A
-fact marked W is not relied on before P0 verifies it.
+Facts checked on 2026-11-21 against agy 1.5.14 and on 2026-11-27 against agy 1.5.18 (P0; macOS
+x86_64). **P** = observed in the probe below, **D** = the docs agy ships in its builtin
+`agy-customizations` skill, **S** = read from the binary's strings, **W** = Google's web docs or
+the issue tracker, not verified locally. A fact marked W is not relied on before P0 verifies it.
 
 | Fact | |
 |---|---|
@@ -36,9 +36,18 @@ fact marked W is not relied on before P0 verifies it.
 | `PreToolUse` stdout `{"decision": "allow"\|"deny"\|"ask"\|"force_ask", "reason", "permissionOverrides", "overwrite"}`; `ask` respects the user's cached "always allow", `force_ask` does not | D |
 | A `deny` blocked `git push --force origin main` under `--dangerously-skip-permissions`; the agent received "tool call denied by pre-tool hook: <reason>" | P |
 | `Stop` stdin: `terminationReason` (`NO_TOOL_CALL`, `ERROR`, `USER_CANCELED`, `MAX_INVOCATIONS`, …), `error`, `fullyIdle`, `continuationActive`; `{"decision":"continue"}` keeps the agent going, anything else lets it stop. `PreInvocation` stdin: `invocationNum`, `initialNumSteps` | D |
-| Hook failure semantics (non-zero exit, timeout, invalid JSON) are not documented | — |
-| `/usage` (alias `/quota`) reports quota, also as `agy -p "/usage" --output-format json`; Pro refreshes every 5 hours with a weekly limit, Free weekly | W |
-| Permissions in `settings.json` accept rules like `"deny": ["command(git push)"]`; deny beats ask beats allow | W |
+| A `PreToolUse` hook that exits non-zero (1 or 2), times out or prints invalid JSON **blocks** the tool call ("Encountered error in tool execution: JSON hook … failed"); exit 0 with empty stdout lets it through | P |
+| A `hooks.json` agy cannot parse (e.g. a flat event given the grouped shape) is **ignored as a whole**, silently: every hook in it is off and the only trace is `Failed to parse hooks file …` in `antigravity-cli/log/cli-*.log`. `SessionStart`, `PreInvocation`, `PostInvocation` and `Stop` take a flat list of handlers; `PreToolUse`/`PostToolUse` take `{matcher, hooks}` groups | P, D |
+| Tools that run commands: `run_command` (`CommandLine`, `WaitMsBeforeAsync`) and **`manage_task`** with `Action: "send_input"` (`Input`, `TaskId`), which writes to a running command's stdin. Others seen: `read_file`, `write_file`, `update_steps` | P |
+| `run_command` gets `GIT_EDITOR=false` and `GIT_PAGER=cat` and nothing else from agy; `core.hooksPath` is untouched and a repository's `pre-push` hook runs | P |
+| `/usage` (alias `/quota`) costs no model request (0 tokens, quota unchanged across calls, ~3 s). `--output-format json` gives `command.data.groups[]` ("Gemini Models", "Claude and GPT models"), each with `buckets[]` of `{id, window: "weekly"\|"5h", remaining_fraction, reset_time}` | P |
+| Without a login, `-p` prints `Authentication required` on stderr at once, then waits 60 s even with stdin closed and exits 1 (`"error":"authentication failed or timed out"`) | P |
+| `/logout` is refused in print mode ("clears stored credentials, an effect that outlives the run"); `--disable-slash-commands` turns every slash command, `/usage` included, into prompt text | P |
+| Permission rules `"deny": ["command(mkdir)"]` match by command prefix and are enforced in `-p` mode; deny beats ask beats allow (W) | P |
+| `--settings` **replaces** the `permissions` of `settings.json` instead of merging: a deny in `settings.json` applies alone, not when `--settings` carries its own `permissions` | P |
+| A conversation copied to another home (`conversations/<id>.db` and `brain/<id>/`, plus that home's own login) resumes there with `--conversation <id>` and keeps its context | P |
+| agy does not set the terminal title (no OSC 0/2; it only queries OSC 11 and 7501) | P |
+| 1.5.18 added `update` and `remote-control` subcommands, `--remote-control`, `--remote-agent`, `--input-format stream-json` and `--disable-slash-commands`; still no auth subcommand | P |
 | `AGY_CLI_DISABLE_AUTO_UPDATE=true` stops the background self-update | W, used in the probe |
 | `agy plugin import gemini\|claude` converts other CLIs' plugins; `agy plugin install\|uninstall\|list\|enable\|disable\|validate` | P |
 
@@ -102,14 +111,15 @@ When agy gains a config-dir variable (#155), squadrn switches to it and drops th
 No auth command, so:
 
 - **Status**: secondary accounts: logged in when the token file exists (never read). Main: the
-  keychain cannot be read without prompting, so the status comes from a headless `agy -p /usage
-  --output-format json` with stdin closed and a short deadline, only when that is shown (P0) to
-  fail fast instead of starting the 60 s login flow; otherwise "unknown".
-- **Login**: `agy -p /usage --output-format text`, which runs the OAuth flow and exits by itself
-  when done (no `/quit` needed), if P0 confirms `/usage` costs no model request; else a one-word
-  prompt.
-- **Logout**: secondary accounts: the token file goes to the trash (`FileLogout`). Main: agy's
-  `/logout`, if P0 finds a non-interactive form; else squadrn prints it.
+  keychain cannot be read without prompting, so squadrn runs `agy -p /usage --output-format json`
+  with stdin closed and a 15 s deadline, reading stderr as it comes: `Authentication required`
+  means logged out and the process is killed at once (it would otherwise wait 60 s); a `SUCCESS`
+  result means logged in; anything else is "unknown". `/usage` costs no model request.
+- **Login**: `agy -p /usage --output-format text`, which runs the OAuth flow, prints the quota
+  and exits by itself.
+- **Logout**: secondary accounts: the token file goes to the trash (`FileLogout`). Main: agy
+  refuses `/logout` in print mode, so squadrn prints "run agy, then /logout".
+- Squadrn never passes `--disable-slash-commands` to these calls.
 
 ### 5. Push guard
 
@@ -117,27 +127,34 @@ No auth command, so:
 hooks, so squadrn owns one key and never edits the user's others):
 
 ```json
-{"squadrn": {"PreToolUse": [{"matcher": "run_command", "hooks": [{"type": "command",
+{"squadrn": {"PreToolUse": [{"matcher": "^(run_command|manage_task)$", "hooks": [{"type": "command",
   "command": "\"<data dir>/plugin/bin/squadrn-hook\" guard-git --agent agy", "timeout": 5}]}]}}
 ```
 
-- `guard-git --agent agy` reads `toolCall.args.CommandLine` and `cwd`, and replies with agy's
-  JSON. **Ask maps to `force_ask`**, so a cached "always allow" never waives a push the guard
-  wants confirmed; deny stays deny. agy is the first provider since Claude Code where the guard
-  can ask instead of deny.
-- The matcher is widened to every tool that runs a shell command once P0 lists them (a terminal
-  input tool may exist besides `run_command`).
-- The fail-closed path depends on how agy treats a hook that fails (P0). Until then the shim
-  prints a JSON deny on stdout *and* exits 2.
+- `guard-git --agent agy` reads `cwd` and the command: `toolCall.args.CommandLine` for
+  `run_command`, `toolCall.args.Input` for `manage_task` with `Action: "send_input"` (other
+  actions are allowed). Input sent to a running command is checked line by line as a command,
+  since the agent can start `sh` and type a push into it. It replies with agy's JSON. **Ask maps
+  to `force_ask`**, so a cached "always allow" never waives a push the guard wants confirmed;
+  deny stays deny. agy is the first provider since Claude Code where the guard can ask instead
+  of deny.
+- Fail-closed holds on agy's side: a hook that exits non-zero, times out or prints invalid JSON
+  blocks the call. Only exit 0 with empty stdout passes, so the shim always prints a decision,
+  and on any error it prints a deny and exits 2.
+- A `hooks.json` agy cannot parse turns **every** hook in it off, silently. Squadrn writes the
+  file atomically, checks its own entry against the documented shape (flat lists for
+  `PreInvocation`/`Stop`, `{matcher, hooks}` groups for tool events) before writing, and
+  refuses to write over a file it cannot parse. `doctor` fails when the file does not parse or
+  when agy's newest log contains `Failed to parse hooks file`.
 - Not a plugin: `agy plugin install` adds a marketplace step for one hook. `hooks.json` is
   deterministic and per account. Revisit if squadrn ships agy skills.
 - Windows: the command runs under `cmd /c`, as for Codex (ADR 0011).
 
-**Layer 2** is the universal git pre-push hook, unless agy, like Gemini CLI, disables git hooks
-in the commands it runs (P0). If it does, the same notice as for Gemini applies.
+**Layer 2** is the universal git pre-push hook. Unlike Gemini CLI, agy leaves `core.hooksPath`
+alone (it only sets `GIT_EDITOR` and `GIT_PAGER`), so all three layers apply.
 
-The standard profile also adds `"ask": ["command(git push)"]` to the settings (if P0 confirms
-the syntax): a second, independent prompt before every push.
+The standard profile also adds `"ask": ["command(git push)"]` to the settings: a second,
+independent prompt before every push.
 
 ### 6. Notifications
 
@@ -148,18 +165,21 @@ Hooks in the same named `squadrn` entry:
   failed (a usage limit when the error says so), `USER_CANCELED` → nothing;
 - the guard's own `ask`/`force_ask` → needs input.
 
-agy has no event for its own permission prompts; tmux pane titles are the fallback if agy sets
-them (P0). Hooks are synchronous: the notify hook prints `{}`, never `"decision":"continue"`
-(which would keep the agent running), exits 0 within 2 s and delivers in the background.
+agy has no event for its own permission prompts and does not set the terminal title, so there
+is no pane-title fallback (`PaneTitleStates` stays empty): a session waiting on agy's own prompt
+shows as working. Hooks are synchronous: the notify hook prints `{}`, never
+`"decision":"continue"` (which would keep the agent running), exits 0 within 2 s and delivers in
+the background.
 
 ### 7. Profiles
 
-Profiles are passed per session with `--settings <state>/antigravity-cli/squadrn-settings.json`,
-a file squadrn owns, so the user's `settings.json` is never merged or re-encoded. How `--settings`
-combines with `settings.json` (merge or replace) is checked in P0. If it replaces it, profiles are
-merged into the account's own `settings.json` as for the other providers (ADR 0011).
+`--settings` replaces the `permissions` of `settings.json` instead of merging (P0), so a
+profile passed that way would silently drop the user's own rules. Profiles are therefore merged
+into the account's own `settings.json` (plain JSON) as for the other providers (ADR 0011), and
+squadrn never passes `--settings`. Rules use agy's syntax, `command(<prefix>)`, matched by
+prefix.
 
-| Profile | Keys (subject to P0 confirming each) |
+| Profile | Keys |
 |---|---|
 | minimal | credential isolation (§3); deny reads of `.env`, `.env.*`, `~/.ssh/**` and other accounts' token files |
 | standard | minimal, the guard, `ask` for `git push`, background self-update off in secondary accounts (`AGY_CLI_DISABLE_AUTO_UPDATE=true`: parallel panes would update one binary at once) |
@@ -167,11 +187,14 @@ merged into the account's own `settings.json` as for the other providers (ADR 00
 
 ### 8. Usage, swap, MCP, shared items
 
-- **Usage**: `RateLimiter` from `agy -p /usage --output-format json` (5-hour and weekly
-  windows, matching `usage.Snapshot`), at most every 5 minutes unless `--refresh`, as for Codex.
-- **Swap**: a conversation is `conversations/<id>.db` plus `brain/<id>/`, which squadrn may
-  copy between accounts and resume with `--conversation <id>`. `Caps.SessionTransfer` stays off
-  until P0 shows a copied conversation resumes; the summary index may need rebuilding.
+- **Usage**: `RateLimiter` from `agy -p /usage --output-format json`, at most every 5 minutes
+  unless `--refresh`, as for Codex. Quota comes in model groups ("Gemini Models", "Claude and
+  GPT models"), each with a 5-hour and a weekly bucket; `usage.Snapshot` takes, per window, the
+  group with the least `remaining_fraction` (used = 1 − remaining) and its `reset_time`, and
+  `usage` shows the groups separately.
+- **Swap**: a conversation is `conversations/<id>.db` plus `brain/<id>/`; copied into another
+  account it resumes there with `--conversation <id>` (P0; the summary index was not needed).
+  `Caps.SessionTransfer` is on.
 - **MCP**: `config/mcp_config.json` (`mcpServers`, `serverUrl` for remote servers); `shared_mcp`
   copies the allowlisted servers with `agy mcp add`.
 - **Shared from main**: `GEMINI.md` (agy reads `~/.gemini/GEMINI.md` and `AGENTS.md`), global
@@ -199,25 +222,33 @@ Google, Apple team `EQHXZ8M8AV`), run with `env -i`, a temporary `HOME` and
 
 The temporary home holding the token was deleted afterwards.
 
-## P0 (before implementation)
+## P0
 
-With one real login in a temporary home:
+Run on 2026-11-27 against agy 1.5.18 on macOS, again with `env -i`, a temporary `HOME`, one real
+login and auto-update off; about 25 `-p` runs. Results are in the fact table and the decisions
+above:
 
-1. hook failure: non-zero exits, exit 2, timeout, invalid or empty stdout → blocked or let through;
-2. the git environment of `run_command` (`env | grep GIT_`): does agy override `core.hooksPath`?
-3. every tool that runs shell commands (matcher);
-4. `-p /usage`: JSON shape, whether it costs a model request, its behaviour without a login and
-   with stdin closed;
-5. a non-interactive logout;
-6. `--settings` vs `settings.json`: merge or replace; the permission rule syntax;
-7. a conversation copied to another home resumes with `--conversation`;
-8. whether agy sets the terminal title;
+| # | Question | Answer |
+|---|---|---|
+| 1 | hook failure | non-zero exit, timeout, invalid JSON block; empty stdout with exit 0 passes; an unparsable `hooks.json` disables all its hooks silently |
+| 2 | git environment | only `GIT_EDITOR`/`GIT_PAGER`; `pre-push` runs: layer 2 applies |
+| 3 | command tools | `run_command`, `manage_task` (`send_input`) |
+| 4 | `/usage` | free; JSON shape above; without a login, stderr says so at once, then 60 s |
+| 5 | logout | none non-interactive (`/logout` refused in print mode) |
+| 6 | `--settings` | replaces `permissions`; rule syntax `command(<prefix>)` confirmed |
+| 7 | conversation copy | resumes in another home |
+| 8 | terminal title | not set |
+
+Still open, not blocking the core:
+
 9. on Linux (a container with and without D-Bus): where the token goes with another `HOME`;
-10. the main account on macOS: keychain item name and whether a second home's login touches it.
+   until checked, `doctor` warns there as §3 says;
+10. the main account on macOS: the keychain item's name and whether a second home's login
+    touches it; checked when the first user sets up `agy/main` through squadrn.
 
 ## Plan
 
-1. **P0** as above; amend this ADR.
+1. **P0** done (above); 9 and 10 remain.
 2. **Core**: `HomeEnv`/`MainState`, the home-restoring environment (§2), file auth, login, logout,
    credential check, doctor (layer-2 status, shared-keyring warning), fake `agy`, `agy.txtar`.
 3. **Guard**: the named hook, `--agent agy` with `force_ask`, the shim's fail-closed reply.

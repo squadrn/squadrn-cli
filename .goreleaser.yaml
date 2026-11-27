@@ -111,7 +111,7 @@ signs:
 release:
   github:
     owner: squadrn
-    name: squadrn
+    name: squadrn-cli
   # Tags with a pre-release suffix (v1.2.0-rc.1) reach the beta channel only.
   prerelease: auto
   # A draft until the release workflow's upgrade jobs pass; its publish job makes it visible.
